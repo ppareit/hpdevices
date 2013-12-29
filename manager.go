@@ -1,6 +1,8 @@
 package hpdevices
 
 import (
+	"encoding/xml"
+	"io/ioutil"
 	"net/http"
 	"strings"
 )
@@ -29,6 +31,7 @@ func NewHPDeviceError(operation, message string, err ...error) error {
 	if len(err) > 0 {
 		e.Err = err[0]
 	}
+	ERROR.Println("HPDeviceError ", e)
 	return e
 }
 
@@ -47,6 +50,42 @@ func (d *HPDevice) IsOnLine() (err error) {
 		resp.Body.Close()
 	}
 	return err
+}
+
+func (d *HPDevice) getStatus() (*scanStatus, error) {
+	resp, err := http.Get(d.URL + "/Scan/Status")
+	if err != nil {
+		return nil, NewHPDeviceError("HPDevice.getStatus", "", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, NewHPDeviceError("HPDevice.getStatus", "GetStatus: Unexpected status"+resp.Status, err)
+	}
+	buffer, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, NewHPDeviceError("HPDevice.getStatus", "ReadAll", err)
+	}
+	status := new(scanStatus)
+	err = xml.Unmarshal(buffer, status)
+	if err != nil {
+		return nil, NewHPDeviceError("HPDevice.getStatus", "Unmarshal", err)
+	}
+	return status, err
+}
+
+func (d *HPDevice) GetSource() (source string, err error) {
+
+	status, err := d.getStatus()
+	if err == nil {
+		if status.AdfState == "Empty" {
+			source = "Platen"
+		} else {
+			source = "Adf"
+		}
+		return source, err
+	}
+	return "", err
 }
 
 // Utilities

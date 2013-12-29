@@ -13,7 +13,6 @@ import (
 
 type ImageWriter interface {
 	NewImageWriter() (io.WriteCloser, error)
-	CloseImage() error
 }
 
 type hpscanJob struct {
@@ -148,7 +147,7 @@ func (sj *hpscanJob) DownloadImage(image_url string, image_height int) (err erro
 		return NewHPDeviceError("ScanJob.DownloadImage", "Error during FixJPEG ", err)
 	}
 
-	err = sj.ImageWriter.CloseImage()
+	err = writer.Close()
 	if err != nil {
 		return NewHPDeviceError("ScanJob.DownloadImage", "Error when closing writer", err)
 	}

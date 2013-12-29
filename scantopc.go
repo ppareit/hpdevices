@@ -6,14 +6,33 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"time"
 )
 
+var (
+	TRACE   *log.Logger
+	INFO    *log.Logger
+	WARNING *log.Logger
+	ERROR   *log.Logger
+)
+
+func InitLogger(traceHandle *log.Logger,
+	infoHandle *log.Logger,
+	warningHandle *log.Logger,
+	errorHandle *log.Logger) {
+
+	TRACE = traceHandle
+	INFO = infoHandle
+	WARNING = warningHandle
+	ERROR = errorHandle
+}
+
 const (
-	destinationTimeOut = 3 * time.Minute      // 30 minutes
-	eventLoopTimeOut   = 2 * time.Minute / 30 // 2 minutes
+	destinationTimeOut = 30 * time.Minute // 30 minutes
+	eventLoopTimeOut   = 2 * time.Minute  // 2 minutes
 )
 
 type DestinationSettings struct {
@@ -25,11 +44,10 @@ type DestinationSettings struct {
 	ColorSpace  string
 }
 
-type DocumentBatchHandlerFactory func(docType string) (DocumentBatchHandler, error)
+type DocumentBatchHandlerFactory func(doctype string, destination *DestinationSettings, format string, previousbatch DocumentBatchHandler) (DocumentBatchHandler, error)
 
 type DocumentBatchHandler interface {
 	NewImageWriter() (io.WriteCloser, error)
-	CloseImage() error
 	CloseDocumentBatch() error
 }
 
@@ -39,25 +57,26 @@ type AgingStamp struct {
 }
 
 type hpscanToPC struct {
-	Device                      *HPDevice
-	DocumentBatchHandlerFactory DocumentBatchHandlerFactory
-	Destinations                map[string]DestinationSettings
-	Http                        http.Client
-	AgingStamp                  AgingStamp
-	DocumentBatchHandler        DocumentBatchHandler
+	Device                      *HPDevice                      // The device properties
+	DocumentBatchHandlerFactory DocumentBatchHandlerFactory    // Function used to generate document manager
+	DocumentBatchHandler        DocumentBatchHandler           // current and previous document batches
+	Destinations                map[string]DestinationSettings // Key is UUID delivered by the device
+	AgingStamp                  AgingStamp                     // keep last event seen to discard old and duplicates
+	scanSource                  string                         // Scan source : Platen,Adf
 }
 
 // NewScanToPC: Create a structure, register destinations and launch event loop
 // returns when connection is dropped or when an error has occured
 
 func NewScanToPC(Device *HPDevice, documentBatchHandlerFactory DocumentBatchHandlerFactory, HostName string, Destinations []DestinationSettings) (stp *hpscanToPC, err error) {
-
+	TRACE.Println("NewScanToPC")
 	stp = new(hpscanToPC)
 	stp.Device = Device
 	stp.DocumentBatchHandlerFactory = documentBatchHandlerFactory
 	stp.Destinations = make(map[string]DestinationSettings)
 
 	err = stp.MainLoop(HostName, Destinations)
+	TRACE.Println("Exit ScanToPC with error", err)
 
 	return stp, err
 }
@@ -77,7 +96,7 @@ func (stp *hpscanToPC) Register(HostName string, Destinations []DestinationSetti
 		}
 
 		r := bytes.NewReader(append([]byte(xmlHeader), buffer...))
-		resp, err := stp.Http.Post(stp.Device.URL+"/WalkupScanToComp/WalkupScanToCompDestinations", "text/xml", r)
+		resp, err := http.Post(stp.Device.URL+"/WalkupScanToComp/WalkupScanToCompDestinations", "text/xml", r)
 		if err != nil {
 			return NewHPDeviceError("hpscanToPC.Register", "POST", err)
 		}
@@ -101,12 +120,18 @@ The loop takes care of following:
 - If an error occurs into the event loop or if timeout requiers to kill the event loop, send the  stop instruction to the loop and waits it's actually done
 	This prevent nasty bugs with several event loops runing concurently
 */
+
+var mainLoopCount = 0
+
 func (stp *hpscanToPC) MainLoop(HostName string, Destinations []DestinationSettings) (err error) {
 
-	// Innital step:
+	// Inital step:
 	//	- register destinations
 	//	- Initiate event loop
+	mainLoopCount++
 
+	TRACE.Println("Enter in MainLoop #", mainLoopCount)
+	defer TRACE.Println("Exit MainLoop #", mainLoopCount)
 	err = stp.Register(HostName, Destinations)
 	if err != nil {
 		return err
@@ -114,15 +139,18 @@ func (stp *hpscanToPC) MainLoop(HostName string, Destinations []DestinationSetti
 	eventsChannel := make(chan *eventTable)
 	errorsChannel := make(chan error)
 	stopChannel := make(chan chan bool)
+
 	err = stp.NewEventLoop(eventsChannel, errorsChannel, stopChannel)
 	if err == nil {
-		var timer time.Timer
+		timer := time.NewTimer(destinationTimeOut)
 		// The loop
 		for {
 			select {
 			case eventTable := <-eventsChannel:
 				err = stp.ParseEventTable(eventTable)
+				timer = time.NewTimer(destinationTimeOut)
 			case <-timer.C:
+				fmt.Println("Time to register again")
 				closedChannel := make(chan bool) // Prepares the closing confirmation channel
 				stopChannel <- closedChannel     // Send the stop instruction with the the closing confirmation
 				<-closedChannel                  // Wait the confirmation of closed state of the event loop
@@ -130,9 +158,10 @@ func (stp *hpscanToPC) MainLoop(HostName string, Destinations []DestinationSetti
 				if err == nil {
 					// Start a new event loop with the new destination
 					err = stp.NewEventLoop(eventsChannel, errorsChannel, stopChannel)
+					timer = time.NewTimer(destinationTimeOut)
 				}
 			case err = <-errorsChannel: // Get errors occurred in the event loop. The event loop is already closed
-
+				fmt.Println("Recieve error from event loop")
 			}
 			if err != nil {
 				return err
@@ -147,13 +176,18 @@ func (stp *hpscanToPC) NewEventLoop(eventsChannel chan *eventTable, errorsChanne
 	return nil
 }
 
+var EventLoopCount = 0
+
 func (stp *hpscanToPC) EventLoop(eventsChannel chan *eventTable, errorsChannel chan error, stopChannel chan chan bool) {
 	var err error
+	EventLoopCount++
+	var elc = EventLoopCount
 
-	// Prepare an HTTP connection with a custom timeout
-	timeoutClient := newTimeoutClient(2*time.Second, 2*eventLoopTimeOut/3) // 1.5 * HP device timeout
+	TRACE.Println("Start EventLoop #", elc)
+	defer TRACE.Println("Stop EventLoop #", elc)
+
 	// on call to get firts events and e-tag
-	resp, err := stp.Http.Get(stp.Device.URL + "/EventMgmt/EventTable")
+	resp, err := http.Get(stp.Device.URL + "/EventMgmt/EventTable")
 	if err != nil {
 		err = NewHPDeviceError("hpscanToPC.EventLoop", "", err)
 	}
@@ -173,8 +207,12 @@ func (stp *hpscanToPC) EventLoop(eventsChannel chan *eventTable, errorsChannel c
 	resp.Body.Close()
 
 	if err == nil {
-		eventsChannel <- et
-
+		eventsChannel <- et // Send firsts events
+		var (
+			timeoutClient *http.Client
+			request       *http.Request
+			response      *http.Response
+		)
 		// Event Loop while no error
 		for err == nil {
 			// Watch stopChannel
@@ -182,55 +220,77 @@ func (stp *hpscanToPC) EventLoop(eventsChannel chan *eventTable, errorsChannel c
 			case okChan := <-stopChannel: // I need to quit....
 				//TODO: kill the current connection. What happen if stops occurs in same time of user event on the device
 
+				TRACE.Println("Quitting hpscanToPC.event loop")
+
 				okChan <- true // Send the information that I have quitted
+				fmt.Println("hpscanToPC.event loop Bye")
 				return
 			default:
-				// Don't block the loop
-			}
-			request, err := http.NewRequest("GET", stp.Device.URL+"/EventMgmt/EventTable?timeout="+fmt.Sprintf("%d", int(eventLoopTimeOut.Seconds())*10), nil)
-			if err != nil {
-				err = NewHPDeviceError("hpscanToPC.EventLoop", "NewRequest", err)
-			}
-			if err == nil {
-				request.Header.Add("If-None-Match", Etag) // Tell to the device which event we already know
-				resp, err = timeoutClient.Do(request)
+				timeoutClient = newTimeoutClient(2*time.Second, eventLoopTimeOut+10*time.Second) // 2 sec for the header, 1.5 * HP device timeout for getting the boddy
+				request, err = http.NewRequest("GET", stp.Device.URL+"/EventMgmt/EventTable?timeout="+fmt.Sprintf("%d", int(eventLoopTimeOut.Seconds())*10), nil)
 				if err != nil {
-					err = NewHPDeviceError("hpscanToPC.EventLoop", "get", err)
+					err = NewHPDeviceError("hpscanToPC.EventLoop", "NewRequest", err)
 				}
-			}
-			if err == nil {
-				switch resp.StatusCode {
-				case 304: // Nothing new since last call
-					resp.Body.Close()
-				case 200: // Something happened
-					Etag = resp.Header.Get("Etag") // Preserve Etag for the next call to the device
-					et = new(eventTable)
-					buffer, err = ioutil.ReadAll(resp.Body)
-					resp.Body.Close()
-					if err != nil {
-						err = NewHPDeviceError("hpscanToPC.EventLoop", "ReadAll", err)
-					}
-					if err == nil {
-						err = xml.Unmarshal(buffer, et)
+				if err == nil {
+					request.Header.Add("If-None-Match", Etag) // Tell to the device which event we already know
+					request.Close = true                      // For closing the connection after having recieved the answer.
+					response, err = timeoutClient.Do(request)
+				}
+				if err != nil {
+					err = NewHPDeviceError("hpscanToPC.EventLoop", "request", err)
+				}
+				if err == nil {
+					// The response
+					switch response.StatusCode {
+					case 304: // Nothing new since last call
+						response.Body.Close()
+						TRACE.Println("EventLoop #", elc, "no event...")
+					case 200: // Something happened
+						Etag = response.Header.Get("Etag") // Preserve Etag for the next call to the device
+						et = new(eventTable)
+						buffer, err = ioutil.ReadAll(response.Body)
+						resp.Body.Close()
 						if err != nil {
-							err = NewHPDeviceError("hpscanToPC.EventLoop", "Marshal", err)
+							err = NewHPDeviceError("hpscanToPC.EventLoop", "ReadAll", err)
 						}
 						if err == nil {
-							eventsChannel <- et // Send the event table to main loop
+							err = xml.Unmarshal(buffer, et)
+							if err != nil {
+								err = NewHPDeviceError("hpscanToPC.EventLoop", "Marshal", err)
+							}
+							if err == nil {
+								TRACE.Println("EventLoop #", elc, "event...")
+								eventsChannel <- et // Send the event table to main loop
+							}
 						}
+					default:
+						response.Body.Close()
+						err = NewHPDeviceError("hpscanToPC.EventLoop", "Unexpected status"+response.Status)
 					}
-				default:
-					resp.Body.Close()
-					err = NewHPDeviceError("hpscanToPC.EventLoop", "Unexpected status"+resp.Status)
 				}
 			}
 		}
 	}
-	// If leaving the loop because on an error, send it to the main loop before closing the go routine
+	// If leaving the loop because of an error, send it to the main loop before closing the go routine
 	if err != nil {
+		fmt.Println("Error detected", err)
 		errorsChannel <- err
 	}
+}
 
+func (stp *hpscanToPC) GetNewEvent(client *http.Client, req *http.Request, respChan chan *http.Response, errChan chan error) {
+	fmt.Println("(hpscanToPC) GetNewEvent query")
+	req.Close = true
+	resp, err := client.Do(req)
+	if err != nil {
+		errChan <- err
+		return
+	}
+
+	fmt.Println("(hpscanToPC) GetNewEvent send response")
+	respChan <- resp
+	fmt.Println("hpscanToPC) GetNewEvent exit")
+	return
 }
 
 // HTTP clients with custom timeout
@@ -276,7 +336,7 @@ func (stp *hpscanToPC) ScanEvent(e event) (err error) {
 	var a AgingStamp
 	n, err := fmt.Sscanf(e.AgingStamp, "%d-%d", &a.i, &a.j) // AgingStamp is like 48-189
 	if err != nil || n != 2 {
-		err = NewHPDeviceError("hpscanToPC.ScanEvent", "Unexpected error", err)
+		err = NewHPDeviceError("hpscanToPC.ScanEvent", "Unexpected AgingStamp", err)
 	}
 	// Check we have something really new
 	if (a.i > stp.AgingStamp.i) || (a.i == stp.AgingStamp.i && a.j > stp.AgingStamp.i) {
@@ -301,11 +361,12 @@ func (stp *hpscanToPC) ScanEvent(e event) (err error) {
 
 func (stp *hpscanToPC) GetWalkupScanToCompDestinations(uri string) (*walkupScanToCompDestination, error) {
 	var dest *walkupScanToCompDestination
-	resp, err := stp.Http.Get(stp.Device.URL + "/WalkupScanToComp/WalkupScanToCompDestinations")
+	//TODO: Is this call absolutly necessaire?
+	resp, err := http.Get(stp.Device.URL + "/WalkupScanToComp/WalkupScanToCompDestinations")
 	if err != nil {
 		err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "", err)
 	}
-	if err != nil && resp.StatusCode != 200 {
+	if err == nil && resp.StatusCode != 200 {
 		resp.Body.Close()
 		err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "Unexpected Status "+resp.Status, err)
 	}
@@ -316,14 +377,15 @@ func (stp *hpscanToPC) GetWalkupScanToCompDestinations(uri string) (*walkupScanT
 			err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "ReadAll", err)
 		}
 
-		dest := new(walkupScanToCompDestination)
-		err = xml.Unmarshal(buffer, dest)
+		//dest := new(walkupScanToCompDestination)
+		//err = xml.Unmarshal(buffer, dest)
+		//if err != nil {
+		//	err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "Unmarshal", err)
+		//}
 
-		// Call the given URI
-		resp, err = stp.Http.Get(stp.Device.URL + uri)
-
-		if err != nil {
-			err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "Get "+uri, err)
+		if err == nil {
+			// Call the given URI
+			resp, err = http.Get(stp.Device.URL + uri)
 		}
 
 		if err == nil && resp.StatusCode != 200 {
@@ -351,7 +413,7 @@ func (stp *hpscanToPC) GetWalkupScanToCompDestinations(uri string) (*walkupScanT
 
 func (stp *hpscanToPC) WalkupScanToCompEvent(Destination *DestinationSettings, walkupScanToCompDestination *walkupScanToCompDestination) error {
 	// Handle a scan event
-	resp, err := stp.Http.Get(stp.Device.URL + "/WalkupScanToComp/WalkupScanToCompEvent")
+	resp, err := http.Get(stp.Device.URL + "/WalkupScanToComp/WalkupScanToCompEvent")
 	if err != nil {
 		err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "", err)
 	}
@@ -376,37 +438,40 @@ func (stp *hpscanToPC) WalkupScanToCompEvent(Destination *DestinationSettings, w
 		if err == nil {
 			switch event.WalkupScanToCompEventType {
 			case "HostSelected": // That's for us...
-				time.Sleep(1 * time.Second / 2) // Test: sometime, the device doesn't provide HPWalkupScanToCompDestination in next event
+				stp.scanSource, err = stp.Device.GetSource()
+				time.Sleep(1 * time.Second / 3) // Test: sometime, the device doesn't provide HPWalkupScanToCompDestination in next event
 
 			case "ScanRequested": // Start Adf scanning or 1st page on Platen scanning
 				//if stp.DocumentBatchHandler  == nil {
 				//	err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "recieved ScanRequested, but DocumentBatchHandlerFactory is nil", nil)
 				//}
-
+				TRACE.Println("Mainloop", mainLoopCount, "ScanRequested")
 				if walkupScanToCompDestination == nil || walkupScanToCompDestination.WalkupScanToCompSettings == nil {
 					err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "recieved ScanRequested, HPWalkupScanToCompDestination nil?", nil)
 				}
-				stp.DocumentBatchHandler, err = stp.DocumentBatchHandlerFactory(walkupScanToCompDestination.WalkupScanToCompSettings.Shortcut[4:])
+				stp.DocumentBatchHandler, err = stp.DocumentBatchHandlerFactory(walkupScanToCompDestination.WalkupScanToCompSettings.Shortcut[4:], Destination, "Jpeg", stp.DocumentBatchHandler)
 				if err != nil {
 					err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "DocumentBatchHandlerFactory", err)
 				}
 				//TODO: ScanSource
-				err = stp.Device.NewScanJob(stp.DocumentBatchHandler, "Platen", Destination.Resolution, Destination.ColorSpace)
+				err = stp.Device.NewScanJob(stp.DocumentBatchHandler, stp.scanSource, Destination.Resolution, Destination.ColorSpace)
 				if err != nil {
 					err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "ScanRequested/NewScanJob", err)
 				}
 
 			case "ScanNewPageRequested": //Subsequent pages on Platen
+				TRACE.Println("Mainloop", mainLoopCount, "ScanNewPageRequested")
 				if stp.DocumentBatchHandler == nil {
 					err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "recieved ScanNewPageRequested, but DocumentBatchHandlerFactory is nil", nil)
 				}
 				//TODO: ScanSource
-				err = stp.Device.NewScanJob(stp.DocumentBatchHandler, "Platen", Destination.Resolution, Destination.ColorSpace)
+				err = stp.Device.NewScanJob(stp.DocumentBatchHandler, stp.scanSource, Destination.Resolution, Destination.ColorSpace)
 				if err != nil {
 					err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "ScanNewPageRequested/NewScanJob", err)
 				}
 
 			case "ScanPagesComplete": //End of ScanBatch
+				TRACE.Println("Mainloop", mainLoopCount, "ScanPagesComplete")
 				if stp.DocumentBatchHandler == nil {
 					err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "recieved ScanPagesComplete, but DocumentBatchHandlerFactory is nil", nil)
 				}
