@@ -56,12 +56,13 @@ type AgingStamp struct {
 	j int
 }
 
+var agingStamp AgingStamp // keep last event seen to discard old and duplicates
+
 type hpscanToPC struct {
 	Device                      *HPDevice                      // The device properties
 	DocumentBatchHandlerFactory DocumentBatchHandlerFactory    // Function used to generate document manager
 	DocumentBatchHandler        DocumentBatchHandler           // current and previous document batches
 	Destinations                map[string]DestinationSettings // Key is UUID delivered by the device
-	AgingStamp                  AgingStamp                     // keep last event seen to discard old and duplicates
 	scanSource                  string                         // Scan source : Platen,Adf
 }
 
@@ -108,6 +109,7 @@ func (stp *hpscanToPC) Register(HostName string, Destinations []DestinationSetti
 		uri := resp.Header.Get("Location")
 		uuid := getUUIDfromURI(uri)
 		stp.Destinations[uuid] = Destination // Link uuid with settings
+		TRACE.Println("hpscanToPC.Register : New destination", uuid, uri)
 	}
 	return nil
 }
@@ -146,11 +148,11 @@ func (stp *hpscanToPC) MainLoop(HostName string, Destinations []DestinationSetti
 		// The loop
 		for {
 			select {
-			case eventTable := <-eventsChannel:
+			case eventTable := <-eventsChannel: // Get event table from HTTP query
 				err = stp.ParseEventTable(eventTable)
 				timer = time.NewTimer(destinationTimeOut)
 			case <-timer.C:
-				fmt.Println("Time to register again")
+				TRACE.Println("hpscanToPC.MainLoop: Time to register again")
 				closedChannel := make(chan bool) // Prepares the closing confirmation channel
 				stopChannel <- closedChannel     // Send the stop instruction with the the closing confirmation
 				<-closedChannel                  // Wait the confirmation of closed state of the event loop
@@ -223,7 +225,6 @@ func (stp *hpscanToPC) EventLoop(eventsChannel chan *eventTable, errorsChannel c
 				TRACE.Println("Quitting hpscanToPC.event loop")
 
 				okChan <- true // Send the information that I have quitted
-				fmt.Println("hpscanToPC.event loop Bye")
 				return
 			default:
 				timeoutClient = newTimeoutClient(2*time.Second, eventLoopTimeOut+10*time.Second) // 2 sec for the header, 1.5 * HP device timeout for getting the boddy
@@ -313,9 +314,11 @@ func newTimeoutClient(connectTimeout time.Duration, readWriteTimeout time.Durati
 	}
 }
 
-func (stp *hpscanToPC) ParseEventTable(eventTable *eventTable) (err error) {
+func (stp *hpscanToPC) ParseEventTable(et *eventTable) (err error) {
+	TRACE.Println("hpscanToPC.ParseEventTable", len(et.Events))
 	// Parse evenCompletet list ScanEvent
-	for _, event := range eventTable.Events {
+	for _, event := range et.Events {
+		TRACE.Println("hpscanToPC.ParseEventTable", "UnqualifiedEventCategory", event.UnqualifiedEventCategory)
 		switch event.UnqualifiedEventCategory {
 		case "ScanEvent":
 			err = stp.ScanEvent(event)
@@ -334,38 +337,50 @@ func (stp *hpscanToPC) ParseEventTable(eventTable *eventTable) (err error) {
 
 func (stp *hpscanToPC) ScanEvent(e event) (err error) {
 	var a AgingStamp
+	TRACE.Println("hpscanToPC.ScanEvent", "Get AgingStamp", e.AgingStamp)
 	n, err := fmt.Sscanf(e.AgingStamp, "%d-%d", &a.i, &a.j) // AgingStamp is like 48-189
 	if err != nil || n != 2 {
-		err = NewHPDeviceError("hpscanToPC.ScanEvent", "Unexpected AgingStamp", err)
-	}
-	// Check we have something really new
-	if (a.i > stp.AgingStamp.i) || (a.i == stp.AgingStamp.i && a.j > stp.AgingStamp.i) {
-		uri := ""
-		for _, payload := range e.Payloads {
-			switch payload.ResourceType {
-			case "wus:WalkupScanToCompDestination":
-				uri = payload.ResourceURI
+		err = NewHPDeviceError("hpscanToPC.ScanEvent", "Incorrert format AgingStamp "+e.AgingStamp, err)
+		TRACE.Println("hpscanToPC.ScanEvent", "Incorrert format AgingStamp "+e.AgingStamp)
+	} else {
+		TRACE.Printf("%s %s %+v %s %+v", "hpscanToPC.ScanEvent", "Memorized", agingStamp, "got", a)
+		if (a.i > agingStamp.i) || (a.i == agingStamp.i && a.j > agingStamp.j) {
+			// Check we have something really new
+			agingStamp = a // Keep last event handled
+			TRACE.Println("hpscanToPC.ScanEvent", "Handling AgingStamp", e.AgingStamp)
+			uri := ""
+			TRACE.Println("hpscanToPC.ScanEvent", "e.Payloads", len(e.Payloads))
+			for i, payload := range e.Payloads {
+				TRACE.Println("hpscanToPC.ScanEvent", i, payload.ResourceType, payload.ResourceURI)
+				switch payload.ResourceType {
+				case "wus:WalkupScanToCompDestination":
+					uri = payload.ResourceURI
+				}
 			}
-		}
-		// Check if the WalkupScanToComp event is for one of our destinations
-		if dest, ok := stp.Destinations[getUUIDfromURI(uri)]; ok {
-			walkupScanToCompDestination, err := stp.GetWalkupScanToCompDestinations(uri)
-			if err == nil {
-				stp.AgingStamp = a
-				err = stp.WalkupScanToCompEvent(&dest, walkupScanToCompDestination)
+			TRACE.Println("hpscanToPC.ScanEven event uri", uri)
+			// Check if the WalkupScanToComp event is for one of our destinations
+			if dest, ok := stp.Destinations[getUUIDfromURI(uri)]; ok {
+				walkupScanToCompDestination, err := stp.GetWalkupScanToCompDestinations(uri)
+				if err == nil {
+					err = stp.WalkupScanToCompEvent(&dest, walkupScanToCompDestination)
+				}
 			}
+		} else {
+			TRACE.Println("hpscanToPC.ScanEvent", "AgingStamp already handled", e.AgingStamp)
 		}
 	}
 	return err
 }
 
 func (stp *hpscanToPC) GetWalkupScanToCompDestinations(uri string) (*walkupScanToCompDestination, error) {
+	TRACE.Println("hpscanToPC.WalkupScanToCompDestinations entering")
 	var dest *walkupScanToCompDestination
 	//TODO: Is this call absolutly necessaire?
 	resp, err := http.Get(stp.Device.URL + "/WalkupScanToComp/WalkupScanToCompDestinations")
 	if err != nil {
 		err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "", err)
 	}
+
 	if err == nil && resp.StatusCode != 200 {
 		resp.Body.Close()
 		err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "Unexpected Status "+resp.Status, err)
@@ -377,11 +392,19 @@ func (stp *hpscanToPC) GetWalkupScanToCompDestinations(uri string) (*walkupScanT
 			err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "ReadAll", err)
 		}
 
-		//dest := new(walkupScanToCompDestination)
-		//err = xml.Unmarshal(buffer, dest)
-		//if err != nil {
-		//	err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "Unmarshal", err)
-		//}
+		destinations := new(walkupScanToCompDestinations)
+		err = xml.Unmarshal(buffer, destinations)
+		if err != nil {
+			err = NewHPDeviceError("hpscanToPC.WalkupScanToCompDestinations", "Unmarshal", err)
+		}
+		have_a_match := false
+		for _, d := range destinations.WalkupScanToCompDestinations {
+			if d.ResourceURI == uri {
+				have_a_match = true
+			}
+		}
+
+		TRACE.Println("hpscanToPC.WalkupScanToCompDestinations have_a_match", have_a_match)
 
 		if err == nil {
 			// Call the given URI
@@ -408,11 +431,13 @@ func (stp *hpscanToPC) GetWalkupScanToCompDestinations(uri string) (*walkupScanT
 			}
 		}
 	}
+	TRACE.Println("hpscanToPC.WalkupScanToCompDestinations", dest.Name, dest.WalkupScanToCompSettings)
 	return dest, err
 }
 
 func (stp *hpscanToPC) WalkupScanToCompEvent(Destination *DestinationSettings, walkupScanToCompDestination *walkupScanToCompDestination) error {
 	// Handle a scan event
+	TRACE.Println("hpscanToPC.WalkupScanToCompEvent", "entering")
 	resp, err := http.Get(stp.Device.URL + "/WalkupScanToComp/WalkupScanToCompEvent")
 	if err != nil {
 		err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "", err)
@@ -432,6 +457,7 @@ func (stp *hpscanToPC) WalkupScanToCompEvent(Destination *DestinationSettings, w
 		if err == nil {
 			err = xml.Unmarshal(buffer, event)
 		}
+		TRACE.Println("hpscanToPC.WalkupScanToCompEvent", event.WalkupScanToCompEventType)
 		if err != nil {
 			err = NewHPDeviceError("hpscanToPC.WalkupScanToCompEvent", "Unmarshal", err)
 		}
@@ -439,7 +465,8 @@ func (stp *hpscanToPC) WalkupScanToCompEvent(Destination *DestinationSettings, w
 			switch event.WalkupScanToCompEventType {
 			case "HostSelected": // That's for us...
 				stp.scanSource, err = stp.Device.GetSource()
-				time.Sleep(1 * time.Second / 3) // Test: sometime, the device doesn't provide HPWalkupScanToCompDestination in next event
+				TRACE.Println("hpscanToPC.WalkupScanToCompEvent", stp.scanSource, err)
+				//time.Sleep(1 * time.Second / 3) // Test: sometime, the device doesn't provide HPWalkupScanToCompDestination in next event
 
 			case "ScanRequested": // Start Adf scanning or 1st page on Platen scanning
 				//if stp.DocumentBatchHandler  == nil {
